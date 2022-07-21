@@ -37,6 +37,7 @@ library
                   , xmlhtml
                   , relude
                   , replace-attoparsec
+                  , sop-core
                   , text
   mixins:           base hiding (Prelude)
                   , relude (Relude as Prelude)
@@ -47,12 +48,8 @@ library
   default-extensions:
     TupleSections
     OverloadedStrings
-    ViewPatterns
     ImportQualifiedPost
-    LambdaCase
     GeneralizedNewtypeDeriving
-    FunctionalDependencies
     ScopedTypeVariables
-    FlexibleContexts
     BlockArguments
-    TypeFamilies
+    ViewPatterns

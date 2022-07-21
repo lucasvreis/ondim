@@ -1,169 +1,191 @@
--- | This file is the heart of Ondim. Here we define the more general template
--- expansion using trees.
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE UndecidableInstances #-}
 
-module Ondim where
-import Data.Tree
+module Ondim
+  ( OndimNode (..)
+  , OndimS (..)
+  , Expansion
+  , Expansions
+  , Expansions'
+  , AttrExpansions'
+  , AttrExpansion
+  , AttrExpansions
+  , emptyOndimS
+  , OndimException (..)
+  , OndimT
+  , runOndimT
+  , withOndimS
+  , getExpansion
+  , liftNode
+  , withExpansions
+  , putExpansion
+  , withAttrExpansions
+  , bindingExpansions
+  , bindingAttrExpansions
+  , runChildrenWith
+  , fromTemplate
+  , callExpansion
+  )
+  where
 import Relude.Extra.Map
 import Data.Map.Syntax
 import Control.Monad.Except
+import Relude.Extra.Lens
+import Data.Attoparsec.Text (char, Parser, string, takeTill)
+import Replace.Attoparsec.Text (streamEditT)
 
-type Expansion m t = OndimT t m (Tree t) -> OndimT t m (Forest t)
+class OndimNode t where
+  identify :: t -> Maybe Text
+  children :: Lens' t [t]
+  attributes :: Lens' t [(Text, Text)]
+  asText :: t -> Text
+  injText :: Text -> t
 
-type Expansions m t = Map (Identifier t) (Expansion m t)
+type Expansion m t = OndimT t m t -> OndimT t m [t]
+type Expansions m t = Map Text (Expansion m t)
+
+type AttrExpansion m t = Text -> OndimT t m [(Text, Text)]
+type AttrExpansions m t = Map Text (AttrExpansion m t)
 
 data OndimS m t = OndimS
   { expansions :: Expansions m t
+  , attrExpansions :: AttrExpansions m t
   , expansionDepth :: Int
   , expansionTrace :: [Text]
-  , afterExpansion :: Forest t -> Forest t
+  , afterExpansion :: [t] -> [t]
   }
 
-emptyOndimS :: (OndimNode t) => OndimS m t
-emptyOndimS = OndimS mempty 0 [] id
+emptyOndimS :: OndimS m t
+emptyOndimS = OndimS mempty mempty 0 [] id
 
-data OndimException
-  = FromTreeGaveNothing
-  | MaxExpansionDepthExceeded [Text]
+newtype OndimException
+  = MaxExpansionDepthExceeded [Text]
   deriving (Show)
 
-newtype OndimT t m a = OndimT { unOndimT :: ReaderT (OndimS m t) (ExceptT OndimException m) a }
-  deriving (Functor, Applicative, Monad, MonadIO, MonadState s, MonadError OndimException)
+newtype OndimT t m a = OndimT { unOndimT :: StateT (OndimS m t) (ExceptT OndimException m) a }
+  deriving (Functor, Applicative, Monad, MonadIO, MonadReader r, MonadError OndimException)
 
 instance MonadTrans (OndimT t) where
   lift = OndimT . lift . lift
 
-runOndimT :: OndimT t m a -> OndimS m t -> m (Either OndimException a)
-runOndimT o = runExceptT . runReaderT (unOndimT o)
+instance MonadState s m => MonadState s (OndimT t m) where
+    get = lift get
+    put = lift . put
+    state = lift . state
 
-withOdimS ::
+runOndimT :: Monad m => OndimT t m a -> OndimS m t -> m (Either OndimException a)
+runOndimT o = runExceptT . evalStateT (unOndimT o)
+
+{- | This function works like @withReaderT@, in the sense that it creates a new
+   scope for the state in which state changes do not leak outside.
+-}
+withStateT' :: Monad m => (t -> s) -> StateT s m a -> StateT t m a
+withStateT' f st =
+  StateT \s -> (, s) <$> evalStateT st (f s)
+
+withOndimS :: Monad m =>
   (OndimS m t -> OndimS m t) ->
   OndimT t m a ->
   OndimT t m a
-withOdimS f = OndimT . withReaderT f . unOndimT
+withOndimS f = OndimT . withStateT' f . unOndimT
 
-asksE :: Monad m => (Expansions m t -> a) -> OndimT t m a
-asksE f = OndimT $ asks (f . expansions)
+getExpansion :: Monad m => Text -> OndimT t m (Maybe (Expansion m t))
+getExpansion k = OndimT $
+  gets (\s -> (fmap (afterExpansion s) .) <$> lookup k (expansions s))
 
-class (Ord (Identifier t), IsString (Identifier t), Show (Identifier t)) => OndimNode t where
-  type Identifier t
-  type Identifier t = Text
-  identify :: t -> Maybe (Identifier t)
-  children :: Tree t -> Forest t
-  children (Node _ c) = c
-  attributes :: Tree t -> Map Text Text
+-- Substitution of ${name} in attribute text
 
--- | This function does most of the magic: it recursively lifts the nodes into
--- an unvaluated state, that can be evaluated with the defined expansions.
-liftNodeTree :: (Monad m, OndimNode t) =>
-  Tree t -> Either (Text, Forest t) (OndimT t m (Forest t))
-liftNodeTree tree@(Node el childs) =
-  fromMaybe (Right doNothing) $ do
-    name <- identify el
-    if name == "bind"
-    then do
-      tag <- lookup "tag" (attributes tree)
-      pure $ Left (tag, properChilds)
-    else pure $ Right $
-      asksE (lookup name) >>= \case
-        Just expansion -> do
-          depth <- OndimT $ asks expansionDepth
-          eTrace <- OndimT $ asks expansionTrace
-          when (depth >= 200) $ -- To avoid recursive expansions
-            throwError (MaxExpansionDepthExceeded eTrace)
-          withOdimS (\s -> s { expansionDepth = depth + 1
-                             , expansionTrace = show name : eTrace}) $
-            expansion (Node el <$> liftedChilds)
-        Nothing -> doNothing
-  where
-    properChilds = children tree
-    doNothing = one . Node el <$> liftedChilds
-    liftedChilds = liftNodeForest childs
-  
-liftNodeForest :: (Monad m, OndimNode t) =>
-  Forest t -> OndimT t m (Forest t)
-liftNodeForest f = do
-  let sub = map liftNodeTree f
-      binds = mapMaybe (fmap toExp . leftToMaybe) sub
-      nodes = mapMaybe rightToMaybe sub
-  withExpansions (fromList binds) $
-    join <$> sequence nodes
-  where
-    toExp = bimap fromText fromTemplate'
+interpParser :: Parser Text
+interpParser = do
+  _ <- string "${"
+  s <- takeTill (== '}')
+  _ <- char '}'
+  pure s
 
--- | Bind expansions using the more abstract interface to Odim (trees).
--- You generally want to use the more user-friendly `bindingExpansions`.
-withExpansions :: OndimNode t => Expansions m t -> OndimT t m a -> OndimT t m a
-withExpansions exps (OndimT readr) = OndimT $
-  withReaderT (\s -> s {expansions = exps <> expansions s}) readr
+interpEditor :: (Monad m, OndimNode t) => Text -> OndimT t m Text
+interpEditor t = do
+  expansion <- getExpansion t
+  fromMaybe (pure t) $ do
+    expansion' <- expansion
+    pure $ foldMap asText <$> expansion' (pure (injText ""))
 
-type Expansions' m t = MapSyntax (Identifier t) (Expansion m t)
+attrEdit :: (Monad m, OndimNode t) => Text -> OndimT t m Text
+attrEdit = streamEditT interpParser interpEditor
 
--- | Convenience function to bind using MapSyntax, but still using trees. In
--- most cases it's nicer to user `bindingExpansions` instead (see below).
-bindingExpansions' :: OndimNode t =>
+expandAttr :: (Monad m, OndimNode t) => (Text, Text) -> OndimT t m [(Text, Text)]
+expandAttr attr = do
+  st <- OndimT $ get
+  mapM (\(x,y) -> (x,) <$> attrEdit y) =<<
+    fromMaybe (pure [attr]) do
+      expansion <- lookup (fst attr) (attrExpansions st)
+      pure $ expansion (snd attr)
+
+-- | This function recursively lifts the nodes into an unvaluated state, that
+-- will be evaluated with the defined expansions.
+liftNode :: forall m t. (Monad m, OndimNode t) => t -> OndimT t m [t]
+liftNode node = do
+  let attr = node ^. attributes
+      child = node ^. children
+      liftedNode = do
+        attr'  <- foldMapM expandAttr attr
+        child' <- withOndimS id $ -- Shield the inner scope
+                  foldMapM liftNode child
+        pure $ node &
+          set attributes attr' &
+          set children child'
+  st <- OndimT $ get
+  fromMaybe (one <$> liftedNode) do
+    name      <- identify node
+    expansion <- lookup name (expansions st)
+    pure do
+      when (expansionDepth st >= 200) $ -- To avoid recursive expansions
+        throwError (MaxExpansionDepthExceeded $ expansionTrace st)
+      withOndimS (\s -> s { expansionDepth = expansionDepth st + 1
+                         , expansionTrace = show name : expansionTrace st}) $
+        afterExpansion st <$> expansion liftedNode
+
+-- | "Bind" new expansions.
+withExpansions :: (Monad m, OndimNode t) => Expansions m t -> OndimT t m a -> OndimT t m a
+withExpansions exps = withOndimS (\s -> s {expansions = exps <> expansions s})
+
+-- | Put a new expansion into the local state, modifying it.
+putExpansion :: (Monad m, OndimNode t) => Text -> Expansion m t -> OndimT t m ()
+putExpansion key exps = OndimT $ modify (\s -> s {expansions = insert key exps (expansions s)})
+
+-- | "Bind" new attr expansions.
+withAttrExpansions :: (Monad m, OndimNode t) => AttrExpansions m t -> OndimT t m a -> OndimT t m a
+withAttrExpansions exps = withOndimS (\s -> s {attrExpansions = exps <> attrExpansions s})
+
+type Expansions' m t = MapSyntax Text (Expansion m t)
+
+type AttrExpansions' m t = MapSyntax Text (AttrExpansion m t)
+
+-- | Convenience function to bind using MapSyntax.
+bindingExpansions :: (Monad m, OndimNode t) =>
   OndimT t m a -> Expansions' m t -> OndimT t m a
-bindingExpansions' o exps = withExpansions (fromRight mempty (runMap exps)) o
+bindingExpansions o exps = withExpansions (fromRight mempty (runMap exps)) o
 
-class OndimNode t => OndimRepr t a | a -> t where
-  toTree :: a -> Tree t
-  fromTree :: Tree t -> Maybe a
-
-fromReprExpansion :: (Monad m, OndimRepr t a) =>
-  (OndimT t m a -> OndimT t m [a]) -> Expansion m t
-fromReprExpansion expansion argNode = do
-  toTree <<$>> expansion do
-    tree <- fromTree <$> argNode
-    case tree of
-      Just tree' -> pure tree'
-      Nothing -> throwError FromTreeGaveNothing
-  `catchError` \case
-    FromTreeGaveNothing -> one <$> argNode
-    x -> throwError x
-
-type ReprExpansions m t a = MapSyntax (Identifier t) (OndimT t m a -> OndimT t m [a])
-
--- | Bind expansions using MapSyntax.
-bindingExpansions :: (Monad m, OndimRepr t a) =>
-  OndimT t m b -> ReprExpansions m t a -> OndimT t m b
-bindingExpansions o exps = bindingExpansions' o $ mapV fromReprExpansion exps
+-- | Convenience function to bind using MapSyntax.
+bindingAttrExpansions :: (Monad m, OndimNode t) =>
+  OndimT t m a -> AttrExpansions' m t -> OndimT t m a
+bindingAttrExpansions o exps = withAttrExpansions (fromRight mempty (runMap exps)) o
 
 runChildrenWith ::
-  (Monad m, OndimRepr t a) =>
-  ReprExpansions m t a  -> Expansion m t
-runChildrenWith exps node = (children <$> node) `bindingExpansions` exps
-
-runChildrenWith' ::
   (Monad m, OndimNode t) =>
   Expansions' m t -> Expansion m t
-runChildrenWith' exps node = (children <$> node) `bindingExpansions'` exps
-
-fromTemplate' ::
-  (Monad m, OndimNode t) =>
-  Forest t -> Expansion m t
-fromTemplate' tpl inner =
-  liftNodeForest tpl `bindingExpansions'` do
-    "apply-content" ## const (children <$> inner)
+runChildrenWith exps node = (view children <$> node) `bindingExpansions` exps
 
 fromTemplate ::
-  (Monad m, OndimRepr t a) =>
-  [a] -> Expansion m t
-fromTemplate = fromTemplate' . fmap toTree
-  
-class HasEmpty t where
-  emptyValue :: t
+  (Monad m, OndimNode t) =>
+  [t] -> Expansion m t
+fromTemplate tpl inner =
+  foldMapM liftNode tpl `bindingExpansions` do
+    "apply-content" ## const (view children <$> inner)
 
-emptyNode :: HasEmpty t => Tree t
-emptyNode = Node emptyValue []
-  
 callExpansion ::
-  (Monad m, OndimNode t, HasEmpty t)
-  => (Identifier t) -> OndimT t m (Forest t)
+  (Monad m, OndimNode t)
+  => Text -> OndimT t m [t]
 callExpansion name = do
-  exps <- asksE (lookup name)
-  maybe (pure []) ($ pure emptyNode) exps
-
-
--- Convenience
-
-fromText :: IsString a => Text -> a
-fromText = fromString . toString
+  exps <- getExpansion name
+  maybe (pure []) ($ pure (injText "")) exps
