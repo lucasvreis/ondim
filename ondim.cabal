@@ -30,15 +30,17 @@ library
                     Ondim.Extra
                     Ondim.HTML
   build-depends:    base >= 4.14 && < 5
+                  , aeson
                   , attoparsec
                   , containers
                   , map-syntax
                   , mtl
-                  , xmlhtml
+                  , pandoc-types
                   , relude
                   , replace-attoparsec
                   , sop-core
                   , text
+                  , xmlhtml
   mixins:           base hiding (Prelude)
                   , relude (Relude as Prelude)
                   , relude
