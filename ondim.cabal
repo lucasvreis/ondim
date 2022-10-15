@@ -45,6 +45,7 @@ library
                   , containers
                   , filepath
                   , filepattern
+                  , HaTeX
                   , map-syntax
                   , mtl
                   , monad-logger
@@ -53,7 +54,7 @@ library
                   , neat-interpolation
                   , replace-attoparsec
                   , text
-                  , unionmount
+                  , unionmount >= 0.2.1
                   , unliftio-core
 
   if flag(with-pandoc)

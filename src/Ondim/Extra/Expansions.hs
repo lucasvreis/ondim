@@ -109,7 +109,7 @@ switchBound node = do
   tag <- getTag <$> attributes node
   flip (maybe $ pure []) tag \tag' -> do
     exp' <- getTextExpansion tag'
-    tagC <- fromMaybe (pure "default") exp'
+    tagC <- fromMaybe (pure "default") (mconcat <<$>> (exp' ?? pure ""))
     switchWithDefault tagC node
 
 -- Binding
@@ -134,7 +134,7 @@ bindText ::
 bindText toTxt node = do
   attrs <- attributes node
   whenJust (getTag attrs) $ \tag -> do
-    putTextExp tag $ toTxt <$> node
+    putTextExp tag $ const $ one . toTxt <$> node
   pure []
 
 -- | This expansion creates a new scope for the its children, in the sense that
@@ -161,7 +161,7 @@ interpParser = do
   pure s
 
 attrEdit :: OndimTag tag => Text -> Ondim tag Text
-attrEdit = streamEditT interpParser callText
+attrEdit = streamEditT interpParser (fmap mconcat . flip callText (pure ""))
 
 attrSub :: OndimTag tag => Filter tag ExpansibleText
 attrSub = (mapM attrEdit =<<)

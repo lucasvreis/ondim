@@ -99,6 +99,8 @@ class
   identify _ = Nothing
   fromText :: Maybe (Text -> [t])
   fromText = Nothing
+  asText :: Maybe (t -> Text)
+  asText = Nothing
   validIdentifiers :: Maybe [Text]
   validIdentifiers = Nothing
 
@@ -114,7 +116,7 @@ data OndimGS tag = OndimGS
  { expansionDepth :: Int
  , expansionTrace :: [Text]
  , inhibitExpansion :: Bool
- , textExpansions :: Map Text (Ondim tag Text)
+ , textExpansions :: Expansions tag Text
  }
  deriving (Generic)
 
@@ -274,7 +276,8 @@ getExpansion name = do
   st  <- Ondim $ mGet @(OndimS tag t)
   if | Just fT <- fromText @tag,
        Just text <- lookup name (textExpansions gst) ->
-         pure $ Just (const $ expCtx name $ fT <$> text)
+         let aT = fromMaybe (const "") (asText @tag)
+          in pure $ Just (expCtx name . fmap (foldMap fT) . text . fmap aT)
      | Just expansion <- lookup name (expansions st) ->
          pure $ Just (expCtx name . expansion)
      | otherwise -> pure Nothing
@@ -282,7 +285,7 @@ getExpansion name = do
 
 getTextExpansion ::
   OndimTag tag =>
-  Text -> Ondim tag (Maybe (Ondim tag Text))
+  Text -> Ondim tag (Maybe (Expansion tag Text))
 getTextExpansion k =
   expCtx k
     (Ondim $ mGets \s -> lookup k (textExpansions s))
@@ -409,7 +412,7 @@ withFilters :: OndimNode tag t => Filters tag t -> Ondim tag a -> Ondim tag a
 withFilters filt = withOndimS (\s -> s {filters = filt <> filters s})
 
 -- | "Bind" text expansions locally.
-withText :: OndimTag tag => Map Text (Ondim tag Text) -> Ondim tag a -> Ondim tag a
+withText :: OndimTag tag => Expansions tag Text -> Ondim tag a -> Ondim tag a
 withText exps = withOndimGS (\s -> s {textExpansions = exps <> textExpansions s})
 
 -- | "Unbind" an expansion locally.
@@ -430,7 +433,7 @@ putExpansion key exps =
   Ondim $ mModify (\s -> s {expansions = insert key exps (expansions s)})
 
 -- | Put a new expansion into the local state, modifying the scope.
-putTextExp :: OndimTag tag => Text -> Ondim tag Text -> Ondim tag ()
+putTextExp :: OndimTag tag => Text -> Expansion tag Text -> Ondim tag ()
 putTextExp key exps =
   Ondim $ mModify (\s -> s {textExpansions = insert key exps (textExpansions s)})
 
@@ -449,7 +452,7 @@ bindingFilters o filts = withFilters (fromRight mempty (runMap filts)) o
 
 -- | Convenience function to bind using MapSyntax.
 bindingText :: OndimTag tag =>
-  Ondim tag a -> MapSyntax Text (Ondim tag Text) -> Ondim tag a
+  Ondim tag a -> Expansions' tag Text -> Ondim tag a
 bindingText o exps = withText (fromRight mempty (runMap exps)) o
 
 fromTemplate :: forall tag t.
@@ -465,7 +468,7 @@ callExpansion name arg = do
   exps <- getExpansion name
   maybe (throwNotBound @t name) ($ arg) exps
 
-callText ::
-  OndimTag tag =>
-  Text -> Ondim tag Text
-callText k = fromMaybe (throwNotBound @Text k) =<< getTextExpansion k
+callText :: OndimTag tag => Text -> Expansion tag Text
+callText k arg = do
+  exps <- getTextExpansion k
+  maybe (throwNotBound @Text k) ($ arg) exps
